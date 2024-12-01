@@ -1,0 +1,98 @@
+# This workflow creates pull requests to update package hashes in 
+# https://github.com/gretel/feed-reticulum
+#
+# Required setup:
+# 1. Install [`gh`](https://cli.github.com/) and setup
+# 1. Create `FEED_REPO_TOKEN` secret:
+#    gh secret set FEED_REPO_TOKEN -R gretel/Reticulum --body "$(gh auth token)"
+# 
+# Optional configuration:
+# - Set `FEED_REPO` env var (default: gretel/feed-reticulum)
+# - Set `FEED_BRANCH` env var (default: master)
+#
+# The token needs permissions to:
+# - Create branches in target feed repo
+# - Create pull requests in target feed repo
+# - Push changes
+
+name: Update Feed
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. 0.8.7)'
+        required: true
+      hash:
+        description: 'SHA256 hash of the wheel'
+        required: true
+      environment:
+        description: 'Target environment'
+        type: choice
+        options:
+          - production 
+          - development
+        default: 'production'
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  FEED_REPO: gretel/feed-reticulum
+  FEED_BRANCH: master
+
+jobs:
+  update-feed:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || (contains(github.ref, '-') && 'development' || 'production') }}
+    steps:
+      - name: Set version and hash
+        id: extract
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "hash=${{ inputs.hash }}" >> $GITHUB_OUTPUT
+          else
+            mkdir -p dist
+            gh release download ${{ github.ref_name }} -p "*.whl.sha256" -D dist
+            [ -f dist/*.whl.sha256 ] || exit 1
+            VERSION=${GITHUB_REF#refs/tags/}
+            HASH=$(cat dist/rns-${VERSION}-*.whl.sha256 | cut -d' ' -f1)
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            echo "hash=${HASH}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout feed repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FEED_REPO }}
+          path: feed
+          token: ${{ secrets.FEED_REPO_TOKEN }}
+
+      - name: Update package hash
+        run: |
+          cd feed/rns
+          sed -i "s/PKG_VERSION:=.*/PKG_VERSION:=${{ steps.extract.outputs.version }}/" Makefile
+          sed -i "s/PKG_HASH:=.*/PKG_HASH:=${{ steps.extract.outputs.hash }}/" Makefile
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.FEED_REPO_TOKEN }}
+          path: feed
+          commit-message: "rns: update to version ${{ steps.extract.outputs.version }}"
+          title: "rns: update to version ${{ steps.extract.outputs.version }}"
+          body: |
+            Updates RNS package to version ${{ steps.extract.outputs.version }}
+            
+            - Updates PKG_VERSION to ${{ steps.extract.outputs.version }}
+            - Updates PKG_HASH to ${{ steps.extract.outputs.hash }}
+            
+            This PR was automatically generated from the release workflow.
+          branch: update-rns-${{ steps.extract.outputs.version }}
+          base: ${{ env.FEED_BRANCH }}
+          delete-branch: true
